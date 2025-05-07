@@ -13,7 +13,6 @@ use gix::{
     sec::{self as git_sec, trust::DefaultForLevel},
     state as git_state,
 };
-#[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -628,6 +627,326 @@ impl DirContents {
             .iter()
             .any(|ext| ext.starts_with('!') && self.has_extension(&ext[1..]))
     }
+}
+
+#[derive(Debug)]
+pub struct AncestorsContents<'a> {
+    // The path of the parent directory of the current directory.
+    path: &'a Path,
+    // The number of ancestors we already processed.
+    skip: usize,
+    // The timeout used when collecting extensions.
+    timeout: Duration,
+    // HashMap of all file names that were requested so far.
+    // If the value for a certain key is present, then the value indicates
+    // whether such a file was found in one of the ancestors or not.
+    // If a key is missing, then we don't know yet whether an ancestor contains
+    // the file in question or not.
+    file_names: HashMap<&'a str, Option<PathBuf>>,
+    // HashMap of all folder names that were requested so far.
+    // If the value for a certain key is present, then the value indicates
+    // whether such a folder was found in one of the ancestors or not.
+    // If a key is missing, then we don't know yet whether an ancestor contains
+    // the folder in question or not.
+    folder_names: HashMap<&'a str, Option<PathBuf>>,
+    // If we did already scan the ancestors for extensions, then this will be a
+    // HashSet containing all extensions found, without dots, e.g. "js" instead
+    // of ".js".
+    extensions: HashMap<String, Option<PathBuf>>,
+}
+
+impl<'a> AncestorsContents<'a> {
+    /// Scans upwards starting from the initial path until a directory containing one of the given
+    /// files or folders is found.
+    ///
+    /// The scan does not cross device boundaries.
+    pub fn scan(
+        &mut self,
+        files: &'a [&'a str],
+        folders: &'a [&'a str],
+        extensions: &'a [&'a str],
+    ) -> Result<Option<PathBuf>, std::io::Error> {
+        // First, check the caches.
+
+        for file in files {
+            let value = self.file_names.get(file);
+            if value.is_some() {
+                return Ok(value.unwrap().clone());
+            }
+        }
+
+        for folder in folders {
+            let value = self.folder_names.get(folder);
+            if value.is_some() {
+                return Ok(value.unwrap().clone());
+            }
+        }
+
+        for extension in extensions {
+            let value = self.extensions.get(extension.to_owned());
+            if value.is_some() {
+                return Ok(value.unwrap().clone());
+            }
+        }
+
+        // Next, check if we find one of the files or folders.
+        // We do this first because if we are successful here, then we don't need to iterate
+        // through all entries in the ancestors.
+
+        let path = self.path;
+        let initial_device_id = path.device_id();
+
+        // We want to avoid reallocations during the search so we pre-allocate a buffer with enough
+        // capacity to hold the longest path + any marker (we could find the length of the longest
+        // marker programmatically but that would actually cost more than preallocating a few bytes too many).
+        let mut skip = self.skip;
+        let mut buf = PathBuf::with_capacity(path.as_os_str().len() + 15);
+        path.clone_into(&mut buf);
+
+        loop {
+            if initial_device_id != buf.device_id() {
+                break;
+            }
+
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+
+            for file in files {
+                // Then for each file, we look for `buf/file`
+                buf.push(file);
+
+                if buf.is_file() {
+                    buf.pop();
+                    self.file_names.insert(file, Some(buf.clone()));
+                    return Ok(Some(buf));
+                }
+
+                // Removing the last pushed item means removing `file`, to replace it with either
+                // the next `file` or the first `folder`, if any
+                buf.pop();
+            }
+
+            for folder in folders {
+                // Then for each folder, we look for `buf/folder`
+                buf.push(folder);
+
+                if buf.is_dir() {
+                    buf.pop();
+                    self.folder_names.insert(folder, Some(buf.clone()));
+                    return Ok(Some(buf));
+                }
+
+                buf.pop();
+            }
+
+            // Then we go up one level until there is no more level to go up with
+            if !buf.pop() {
+                break;
+            }
+        }
+
+        // Now, collect ALL extension found in the ancestors.
+        let start = Instant::now();
+        let mut skip = self.skip;
+        path.clone_into(&mut buf);
+        loop {
+            if initial_device_id != buf.device_id() {
+                break;
+            }
+
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+
+            fs::read_dir(&buf)?
+                .enumerate()
+                .take_while(|(n, _)| {
+                    cfg!(test) // ignore timeout during tests
+                    || n & 0xFF != 0 // only check timeout once every 2^8 entries
+                    || start.elapsed() < self.timeout
+                })
+                .filter_map(|(_, entry)| {
+                    let entry_path = entry.ok()?.path();
+                    let file_name: String = entry_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    if entry_path.is_file() && !file_name.starts_with('.') {
+                        Some((entry_path, file_name))
+                    } else {
+                        None
+                    }
+                })
+                .for_each(|(entry_path, entry_name)| {
+                    // Extract the file extensions; See DirContents for the
+                    // explanation why we do that.
+                    entry_name.split_once('.').map(|(_, exts)| {
+                        let key: String = exts.to_string();
+                        if self.extensions.get(&key).is_none() {
+                            self.extensions.insert(key, Some(buf.clone()));
+                        };
+                    });
+
+                    entry_path.extension().map(|ext| {
+                        let key: String = ext.to_string_lossy().to_string();
+                        if self.extensions.get(&key).is_none() {
+                            self.extensions.insert(key, Some(buf.clone()));
+                        };
+                    });
+                });
+
+            for extension in extensions {
+                let value = self.extensions.get(extension.to_owned());
+                if value.is_some() {
+                    return Ok(value.unwrap().clone());
+                }
+            }
+
+            // Then we go up one level until there is no more level to go up with
+            if !buf.pop() {
+                break;
+            }
+        }
+
+        Ok(None)
+    }
+    //     #[cfg(test)]
+    //     fn from_path(base: &Path, follow_symlinks: bool) -> Result<Self, std::io::Error> {
+    //         Self::from_path_with_timeout(base, Duration::from_secs(30), follow_symlinks)
+    //     }
+    //
+    //     fn from_path_with_timeout(
+    //         base: &Path,
+    //         timeout: Duration,
+    //         follow_symlinks: bool,
+    //     ) -> Result<Self, std::io::Error> {
+    //         let start = Instant::now();
+    //
+    //         let mut folders: HashSet<PathBuf> = HashSet::new();
+    //         let mut files: HashSet<PathBuf> = HashSet::new();
+    //         let mut file_names: HashSet<String> = HashSet::new();
+    //         let mut extensions: HashSet<String> = HashSet::new();
+    //
+    //         fs::read_dir(base)?
+    //             .enumerate()
+    //             .take_while(|(n, _)| {
+    //                 cfg!(test) // ignore timeout during tests
+    //                 || n & 0xFF != 0 // only check timeout once every 2^8 entries
+    //                 || start.elapsed() < timeout
+    //             })
+    //             .filter_map(|(_, entry)| entry.ok())
+    //             .for_each(|entry| {
+    //                 let path = PathBuf::from(entry.path().strip_prefix(base).unwrap());
+    //
+    //                 let is_dir = match follow_symlinks {
+    //                     true => entry.path().is_dir(),
+    //                     false => fs::symlink_metadata(entry.path())
+    //                         .map(|m| m.is_dir())
+    //                         .unwrap_or(false),
+    //                 };
+    //
+    //                 if is_dir {
+    //                     folders.insert(path);
+    //                 } else {
+    //                     if !path.to_string_lossy().starts_with('.') {
+    //                         // Extract the file extensions (yes, that's plural) from a filename.
+    //                         // Why plural? Consider the case of foo.tar.gz. It's a compressed
+    //                         // tarball (tar.gz), and it's a gzipped file (gz). We should be able
+    //                         // to match both.
+    //
+    //                         // find the minimal extension on a file. ie, the gz in foo.tar.gz
+    //                         // NB the .to_string_lossy().to_string() here looks weird but is
+    //                         // required to convert it from a Cow.
+    //                         path.extension()
+    //                             .map(|ext| extensions.insert(ext.to_string_lossy().to_string()));
+    //
+    //                         // find the full extension on a file. ie, the tar.gz in foo.tar.gz
+    //                         path.file_name().map(|file_name| {
+    //                             file_name
+    //                                 .to_string_lossy()
+    //                                 .split_once('.')
+    //                                 .map(|(_, after)| extensions.insert(after.to_string()))
+    //                         });
+    //                     }
+    //                     if let Some(file_name) = path.file_name() {
+    //                         // this .to_string_lossy().to_string() is also required
+    //                         file_names.insert(file_name.to_string_lossy().to_string());
+    //                     }
+    //                     files.insert(path);
+    //                 }
+    //             });
+    //
+    //         log::trace!(
+    //             "Building HashSets of directory files, folders and extensions took {:?}",
+    //             start.elapsed()
+    //         );
+    //
+    //         Ok(Self {
+    //             files,
+    //             file_names,
+    //             folders,
+    //             extensions,
+    //         })
+    //     }
+    //
+    //     pub fn files(&self) -> impl Iterator<Item = &PathBuf> {
+    //         self.files.iter()
+    //     }
+    //
+    //     pub fn has_file(&self, path: &str) -> bool {
+    //         self.files.contains(Path::new(path))
+    //     }
+    //
+    //     pub fn has_file_name(&self, name: &str) -> bool {
+    //         self.file_names.contains(name)
+    //     }
+    //
+    //     pub fn has_folder(&self, path: &str) -> bool {
+    //         self.folders.contains(Path::new(path))
+    //     }
+    //
+    //     pub fn has_extension(&self, ext: &str) -> bool {
+    //         self.extensions.contains(ext)
+    //     }
+    //
+    //     pub fn has_any_positive_file_name(&self, names: &[&str]) -> bool {
+    //         names
+    //             .iter()
+    //             .any(|name| !name.starts_with('!') && self.has_file_name(name))
+    //     }
+    //
+    //     pub fn has_any_positive_folder(&self, paths: &[&str]) -> bool {
+    //         paths
+    //             .iter()
+    //             .any(|path| !path.starts_with('!') && self.has_folder(path))
+    //     }
+    //
+    //     pub fn has_any_positive_extension(&self, exts: &[&str]) -> bool {
+    //         exts.iter()
+    //             .any(|ext| !ext.starts_with('!') && self.has_extension(ext))
+    //     }
+    //
+    //     pub fn has_no_negative_file_name(&self, names: &[&str]) -> bool {
+    //         !names
+    //             .iter()
+    //             .any(|name| name.starts_with('!') && self.has_file_name(&name[1..]))
+    //     }
+    //
+    //     pub fn has_no_negative_folder(&self, paths: &[&str]) -> bool {
+    //         !paths
+    //             .iter()
+    //             .any(|path| path.starts_with('!') && self.has_folder(&path[1..]))
+    //     }
+    //
+    //     pub fn has_no_negative_extension(&self, exts: &[&str]) -> bool {
+    //         !exts
+    //             .iter()
+    //             .any(|ext| ext.starts_with('!') && self.has_extension(&ext[1..]))
+    //     }
 }
 
 pub struct Repo {
